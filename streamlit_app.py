@@ -10,6 +10,7 @@ Improvements over v1:
 Single-file Streamlit app. Session-based storage.
 """
 
+import os
 import streamlit as st
 import pandas as pd
 import json
@@ -208,7 +209,11 @@ def prepare_file(uploaded_file, provider_name: str) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _get_secret(key: str) -> str | None:
-    return st.secrets.get(key)
+    try:
+        return st.secrets.get(key)
+    except Exception:
+        return os.getenv(key)
+
 
 
 def call_llm(system: str, user_blocks, max_tokens: int = 4000) -> str:
