@@ -65,22 +65,37 @@ BATCH_SIZE = 5
 LLM_PROVIDERS = {
     "Anthropic Claude": {
         "models": [
-            "claude-sonnet-4-6",
+            "claude-opus-4-7",
             "claude-opus-4-6",
+            "claude-sonnet-4-6",
             "claude-haiku-4-5-20251001",
         ],
         "secret_key": "ANTHROPIC_API_KEY",
-        "native_pdf": True,          # sends PDF as base64 document natively
+        "native_pdf": True,
         "hint": "Best overall quality. Native PDF understanding.",
     },
     "OpenAI": {
-        "models": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"],
+        "models": [
+            "gpt-5.5",
+            "gpt-5.5-pro",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+            "gpt-5.2",
+        ],
         "secret_key": "OPENAI_API_KEY",
         "native_pdf": False,
         "hint": "Strong reasoning. PDFs are text-extracted first.",
     },
     "Google Gemini": {
-        "models": ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.0-flash"],
+        "models": [
+            "gemini-3-flash-preview",
+            "gemini-3.1-pro-preview",
+            "gemini-3.1-flash-lite-preview",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+        ],
         "secret_key": "GOOGLE_API_KEY",
         "native_pdf": False,
         "hint": "Large context window. Good for very long documents.",
@@ -88,8 +103,11 @@ LLM_PROVIDERS = {
     "Groq (Open Source)": {
         "models": [
             "llama-3.3-70b-versatile",
-            "mixtral-8x7b-32768",
             "llama-3.1-8b-instant",
+            "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
+            "qwen/qwen3-32b",
+            "meta-llama/llama-4-scout-17b-16e-instruct",
         ],
         "secret_key": "GROQ_API_KEY",
         "native_pdf": False,
