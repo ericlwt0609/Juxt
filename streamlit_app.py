@@ -809,7 +809,7 @@ def export_to_word(results, metadata, title, subtitle="", prepared_by="") -> Byt
     for i, r in enumerate(results, 1):
         cls  = r.get("classification", "")
         row  = table.add_row().cells
-         vals = [
+vals = [
             str(i),
             str(r.get("section") or ""),
             str(r.get("clauseText") or ""),
@@ -817,8 +817,7 @@ def export_to_word(results, metadata, title, subtitle="", prepared_by="") -> Byt
             STATUS_LABELS.get(cls, "Pending"),
             str(r.get("reason") or ""),
             str(r.get("alternative") or ""),
-        ]
-        for cell, val, w in zip(row, vals, col_widths):
+        ]        for cell, val, w in zip(row, vals, col_widths):
             cell.text  = val
             cell.width = w
             for p in cell.paragraphs:
