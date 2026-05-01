@@ -817,7 +817,8 @@ vals = [
             STATUS_LABELS.get(cls, "Pending"),
             str(r.get("reason") or ""),
             str(r.get("alternative") or ""),
-        ]        for cell, val, w in zip(row, vals, col_widths):
+        ]        
+for cell, val, w in zip(row, vals, col_widths):
             cell.text  = val
             cell.width = w
             for p in cell.paragraphs:
