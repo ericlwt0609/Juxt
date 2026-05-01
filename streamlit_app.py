@@ -809,14 +809,14 @@ def export_to_word(results, metadata, title, subtitle="", prepared_by="") -> Byt
     for i, r in enumerate(results, 1):
         cls  = r.get("classification", "")
         row  = table.add_row().cells
-        vals = [
+         vals = [
             str(i),
-            r.get("section", ""),
-            r.get("clauseText", ""),
-            r.get("playbookClause", ""),
+            str(r.get("section") or ""),
+            str(r.get("clauseText") or ""),
+            str(r.get("playbookClause") or ""),
             STATUS_LABELS.get(cls, "Pending"),
-            r.get("reason", ""),
-            r.get("alternative", ""),
+            str(r.get("reason") or ""),
+            str(r.get("alternative") or ""),
         ]
         for cell, val, w in zip(row, vals, col_widths):
             cell.text  = val
