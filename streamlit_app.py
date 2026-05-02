@@ -1,22 +1,23 @@
 """
-RFP Compliance Analyzer — v6
+RFP Compliance Analyzer — v7
 ==============================
-Improvements over v5:
- (i)   Curated model allowlists per provider (3-4 known-good models each)
- (ii)  Live API verification: only show curated models the API key can access
- (iii) "Test API" button for one-click diagnosis of billing/rate/auth errors
+Improvements over v6:
+ (i)   Rule-based model filters (no hardcoded model names; truly dynamic)
+ (ii)  Gemini JSON mode via response_mime_type — fixes parse failures
+ (iii) Larger token budget (8000) and smaller batch size (3) for analyze_batch
+ (iv)  Parse-failure rows now show response preview for diagnosis
 
 Single-file Streamlit app. Session-based storage.
 """
 
 import os
+import re
 import hmac
+import json
+import math
+import base64
 import streamlit as st
 import pandas as pd
-import json
-import re
-import base64
-import math
 from io import BytesIO
 from datetime import datetime
 
@@ -61,7 +62,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Global CSS: guarantee scroll on long dropdowns
 st.markdown(
     """
     <style>
@@ -76,7 +76,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-BATCH_SIZE = 5
+# Smaller batch + larger output budget = fewer truncation failures
+BATCH_SIZE = 3
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -127,102 +128,131 @@ def check_password() -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CURATED MODEL ALLOWLISTS
+# MODEL DISCOVERY (RULE-BASED FILTERS)
 # ══════════════════════════════════════════════════════════════════════════════
-# Hand-picked, known-good models per provider. The dropdown shows the
-# intersection of (allowlist) ∩ (live API list) — so the user only ever
-# sees models that are both known-good AND verified accessible to their key.
-# If the live fetch fails, the allowlist itself is shown.
+# Each provider's model list is fetched live. The filter functions below
+# decide which models are usable for this app. NO hardcoded model names —
+# the rules are pattern-based, so new models from each provider appear
+# automatically as long as they fit the pattern.
 
-ANTHROPIC_RECOMMENDED = [
-    "claude-haiku-4-5-20251001",   # cheapest, fastest
-    "claude-sonnet-4-6",            # balanced (default)
-    "claude-opus-4-6",              # premium
-    "claude-opus-4-7",              # latest premium
-]
+def _filter_anthropic(model_id: str) -> bool:
+    """Keep current-generation Claude chat models. Drop Claude 1/2/3 family."""
+    if not model_id.startswith(("claude-opus-", "claude-sonnet-", "claude-haiku-")):
+        return False
+    # Drop deprecated generations: claude-3, claude-3-5, claude-3-7, claude-2, claude-1
+    deprecated_markers = ("claude-1-", "claude-2-",
+                          "claude-3-haiku", "claude-3-sonnet", "claude-3-opus",
+                          "claude-3-5-", "claude-3-7-")
+    return not any(d in model_id for d in deprecated_markers)
 
-# All paid tier — picking only the latest stable family
-OPENAI_RECOMMENDED = [
-    "gpt-5.4-nano",   # cheapest
-    "gpt-5.4-mini",   # cheap
-    "gpt-5.4",        # balanced
-    "gpt-5.5",        # premium
-]
 
-# Free-tier-friendly options first; pro is paid
-GEMINI_RECOMMENDED = [
-    "gemini-2.5-flash-lite",   # cheapest, free tier
-    "gemini-2.5-flash",         # free tier (recommended)
-    "gemini-2.5-pro",           # paid, best quality
-]
+def _filter_openai(model_id: str) -> bool:
+    """Keep GPT-5.x and above chat models. Drop legacy and non-chat."""
+    if not model_id.startswith("gpt-"):
+        return False
+    # Exclude non-chat or auxiliary modalities
+    excluded_substrings = (
+        "embed", "whisper", "tts", "dall", "instruct", "transcribe",
+        "moderation", "babbage", "davinci", "audio", "image", "realtime",
+        "search",
+    )
+    if any(x in model_id.lower() for x in excluded_substrings):
+        return False
+    # Drop legacy generations (GPT-3, GPT-4)
+    if model_id.startswith(("gpt-3", "gpt-4")):
+        return False
+    return True
 
-# Only known-free Groq models — preview/paid models excluded
-GROQ_RECOMMENDED = [
-    "llama-3.1-8b-instant",          # fastest, free tier
-    "llama-3.3-70b-versatile",       # balanced, free tier (recommended)
-]
+
+def _filter_gemini(model_name: str) -> bool:
+    """Keep Gemini 2.5+ text models. Drop legacy and non-text."""
+    # Drop legacy generations
+    if any(v in model_name for v in ("gemini-1.0", "gemini-1.5", "gemini-2.0")):
+        return False
+    # Drop non-text or experimental modalities
+    excluded_substrings = (
+        "embedding", "image", "audio", "live", "tts", "vision",
+        "veo", "imagen", "lyria", "nano-banana", "thinking-exp",
+    )
+    if any(x in model_name.lower() for x in excluded_substrings):
+        return False
+    # Must be a gemini-* model
+    return model_name.startswith("gemini-")
+
+
+def _filter_groq(model_id: str) -> bool:
+    """Keep chat-completion models on Groq. Drop audio/safety/embed."""
+    excluded_substrings = ("whisper", "tts", "embed", "guard", "prompt-guard")
+    return not any(x in model_id.lower() for x in excluded_substrings)
+
+
+# Minimal fallbacks shown when the live API call fails or no key is set.
+# These are not the "preferred list" — they're emergency stand-ins so the
+# UI never shows an empty dropdown. Each is a known-working model ID.
+FALLBACK_MODELS = {
+    "Anthropic Claude": ["claude-sonnet-4-6"],
+    "OpenAI": ["gpt-5.4-mini"],
+    "Google Gemini": ["gemini-2.5-flash"],
+    "Groq (Open Source)": ["llama-3.3-70b-versatile"],
+}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_anthropic_models(api_key: str) -> list:
     if not api_key or Anthropic is None:
-        return ANTHROPIC_RECOMMENDED
+        return FALLBACK_MODELS["Anthropic Claude"]
     try:
         client = Anthropic(api_key=api_key)
-        page = client.models.list(limit=50)
-        live_ids = {m.id for m in page.data}
-        verified = [m for m in ANTHROPIC_RECOMMENDED if m in live_ids]
-        return verified or ANTHROPIC_RECOMMENDED
+        page = client.models.list(limit=100)
+        ids = [m.id for m in page.data if _filter_anthropic(m.id)]
+        return sorted(ids, reverse=True) or FALLBACK_MODELS["Anthropic Claude"]
     except Exception:
-        return ANTHROPIC_RECOMMENDED
+        return FALLBACK_MODELS["Anthropic Claude"]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_openai_models(api_key: str) -> list:
     if not api_key or OpenAI is None:
-        return OPENAI_RECOMMENDED
+        return FALLBACK_MODELS["OpenAI"]
     try:
         client = OpenAI(api_key=api_key)
         page = client.models.list()
-        live_ids = {m.id for m in page.data}
-        verified = [m for m in OPENAI_RECOMMENDED if m in live_ids]
-        return verified or OPENAI_RECOMMENDED
+        ids = [m.id for m in page.data if _filter_openai(m.id)]
+        return sorted(set(ids), reverse=True) or FALLBACK_MODELS["OpenAI"]
     except Exception:
-        return OPENAI_RECOMMENDED
+        return FALLBACK_MODELS["OpenAI"]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_gemini_models(api_key: str) -> list:
     if not api_key or genai is None:
-        return GEMINI_RECOMMENDED
+        return FALLBACK_MODELS["Google Gemini"]
     try:
         genai.configure(api_key=api_key)
-        live_ids = set()
+        ids = []
         for m in genai.list_models():
             methods = getattr(m, "supported_generation_methods", []) or []
             if "generateContent" not in methods:
                 continue
             name = (m.name or "").replace("models/", "")
-            if name:
-                live_ids.add(name)
-        verified = [m for m in GEMINI_RECOMMENDED if m in live_ids]
-        return verified or GEMINI_RECOMMENDED
+            if name and _filter_gemini(name):
+                ids.append(name)
+        return sorted(set(ids), reverse=True) or FALLBACK_MODELS["Google Gemini"]
     except Exception:
-        return GEMINI_RECOMMENDED
+        return FALLBACK_MODELS["Google Gemini"]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_groq_models(api_key: str) -> list:
     if not api_key or Groq is None:
-        return GROQ_RECOMMENDED
+        return FALLBACK_MODELS["Groq (Open Source)"]
     try:
         client = Groq(api_key=api_key)
         page = client.models.list()
-        live_ids = {m.id for m in page.data}
-        verified = [m for m in GROQ_RECOMMENDED if m in live_ids]
-        return verified or GROQ_RECOMMENDED
+        ids = [m.id for m in page.data if _filter_groq(m.id)]
+        return sorted(ids) or FALLBACK_MODELS["Groq (Open Source)"]
     except Exception:
-        return GROQ_RECOMMENDED
+        return FALLBACK_MODELS["Groq (Open Source)"]
 
 
 def clear_model_caches():
@@ -370,7 +400,12 @@ def prepare_file(uploaded_file, provider_name: str) -> dict:
 # LLM ABSTRACTION LAYER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def call_llm(system: str, user_blocks, max_tokens: int = 4000) -> str:
+def call_llm(system: str, user_blocks, max_tokens: int = 4000, json_mode: bool = False) -> str:
+    """
+    Unified LLM call. When json_mode=True, providers that support a native
+    JSON response mode (currently Gemini) are configured to return clean JSON
+    without markdown wrapping or preamble.
+    """
     provider = st.session_state.get("llm_provider", "Anthropic Claude")
     model = st.session_state.get("llm_model", "claude-sonnet-4-6")
 
@@ -395,14 +430,17 @@ def call_llm(system: str, user_blocks, max_tokens: int = 4000) -> str:
             st.stop()
         client = OpenAI(api_key=key)
         text = user_blocks if isinstance(user_blocks, str) else _blocks_to_text(user_blocks)
-        resp = client.chat.completions.create(
-            model=model,
-            max_tokens=max_tokens,
-            messages=[
+        kwargs = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": text},
             ],
-        )
+        }
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        resp = client.chat.completions.create(**kwargs)
         return resp.choices[0].message.content or ""
 
     if provider == "Google Gemini":
@@ -413,9 +451,12 @@ def call_llm(system: str, user_blocks, max_tokens: int = 4000) -> str:
         genai.configure(api_key=key)
         text = user_blocks if isinstance(user_blocks, str) else _blocks_to_text(user_blocks)
         m = genai.GenerativeModel(model_name=model, system_instruction=system)
+        gen_config_kwargs = {"max_output_tokens": max_tokens}
+        if json_mode:
+            gen_config_kwargs["response_mime_type"] = "application/json"
         resp = m.generate_content(
             text,
-            generation_config=genai.GenerationConfig(max_output_tokens=max_tokens),
+            generation_config=genai.GenerationConfig(**gen_config_kwargs),
         )
         return resp.text or ""
 
@@ -426,14 +467,17 @@ def call_llm(system: str, user_blocks, max_tokens: int = 4000) -> str:
             st.stop()
         client = Groq(api_key=key)
         text = user_blocks if isinstance(user_blocks, str) else _blocks_to_text(user_blocks)
-        resp = client.chat.completions.create(
-            model=model,
-            max_tokens=max_tokens,
-            messages=[
+        kwargs = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": text},
             ],
-        )
+        }
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        resp = client.chat.completions.create(**kwargs)
         return resp.choices[0].message.content or ""
 
     raise ValueError(f"Unknown provider: {provider}")
@@ -455,10 +499,6 @@ def _blocks_to_text(blocks) -> str:
 
 
 def diagnose_error(err: Exception) -> tuple:
-    """
-    Inspect an exception from call_llm and return (icon, category, hint).
-    Used by the Test API button to give actionable diagnosis.
-    """
     msg = str(err).lower()
     if "credit" in msg or "balance" in msg or "insufficient_quota" in msg:
         return ("💳", "Billing",
@@ -470,7 +510,7 @@ def diagnose_error(err: Exception) -> tuple:
         return ("📊", "Quota",
                 "Your account/region has no quota allocated for this model. "
                 "Check provider console; may need billing enabled.")
-    if "401" in msg or "unauthor" in msg or "invalid" in msg and "key" in msg:
+    if "401" in msg or "unauthor" in msg or ("invalid" in msg and "key" in msg):
         return ("🔑", "Auth",
                 "API key is invalid, expired, or revoked. "
                 "Generate a new key in the provider console and update Streamlit secrets.")
@@ -490,6 +530,14 @@ def diagnose_error(err: Exception) -> tuple:
 
 
 def extract_json_array(text: str):
+    """
+    Robust JSON-array extraction. Handles:
+      - Clean JSON arrays (json_mode output)
+      - Markdown-wrapped JSON (```json ... ```)
+      - JSON arrays inside preamble text
+      - Truncated arrays (recovers partial via brace counting)
+    Returns parsed list or None.
+    """
     if not text:
         return None
     clean = re.sub(r"```json|```", "", text).strip()
@@ -630,7 +678,7 @@ For each item return:
 
 Extract 10–30 most material items. Skip neutral boilerplate (cover page, index, contacts).
 
-Return ONLY a JSON array:
+Return ONLY a JSON array (or a single JSON object with a "clauses" key containing the array):
 [{{"id":"1","section":"Clause 3.1","clauseText":"..."}}, ...]"""
 
     if rfp_data["type"] == "document":
@@ -638,8 +686,8 @@ Return ONLY a JSON array:
     else:
         user_blocks = f"RFP DOCUMENT:\n\n{rfp_data['payload']}\n\n---\n\n{instruction}"
 
-    raw = call_llm(system, user_blocks, max_tokens=8000)
-    clauses = extract_json_array(raw)
+    raw = call_llm(system, user_blocks, max_tokens=8000, json_mode=True)
+    clauses = _parse_clauses_response(raw)
     if not clauses:
         preview = (raw or "")[:500]
         raise ValueError(
@@ -647,6 +695,36 @@ Return ONLY a JSON array:
             "Common causes: scanned PDF without OCR, empty document, or unexpected format."
         )
     return clauses
+
+
+def _parse_clauses_response(raw: str) -> list:
+    """
+    Parse a clauses-extraction response. Handles both:
+      - Direct array: [{...}, {...}]
+      - Object wrapping: {"clauses": [{...}]}  (Gemini json_mode often wraps)
+    """
+    if not raw:
+        return []
+    parsed = extract_json_array(raw)
+    if parsed:
+        return parsed
+    # Try parsing as JSON object that wraps the array
+    try:
+        clean = re.sub(r"```json|```", "", raw).strip()
+        obj = json.loads(clean)
+        if isinstance(obj, list):
+            return obj
+        if isinstance(obj, dict):
+            for key in ("clauses", "items", "results", "data"):
+                if isinstance(obj.get(key), list):
+                    return obj[key]
+            # Fall back: take the first list-valued value
+            for v in obj.values():
+                if isinstance(v, list):
+                    return v
+    except json.JSONDecodeError:
+        pass
+    return []
 
 
 def analyze_batch(
@@ -686,7 +764,8 @@ Context: {focus}
 Clauses:
 {json.dumps(clauses, indent=2)}
 
-Return ONE object per clause (matching IDs):
+Return ONE object per clause (matching IDs). You may return either a bare JSON
+array, or a JSON object with an "analyses" key containing the array:
 [{{
   "id": "1",
   "playbookClause": "Section X of playbook: ...",
@@ -700,12 +779,15 @@ Return ONE object per clause (matching IDs):
     else:
         user_blocks = f"PLAYBOOK / REFERENCE STANDARD:\n\n{pb_data['payload']}\n\n---\n\n{instruction}"
 
-    raw = call_llm(system, user_blocks, max_tokens=4000)
-    analyses = extract_json_array(raw)
+    # Larger token budget — analyse_batch outputs ~600-800 tokens per clause
+    # with reason/alternative fields, so 3 clauses can need up to ~3000 output tokens
+    raw = call_llm(system, user_blocks, max_tokens=8000, json_mode=True)
+    analyses = _parse_clauses_response(raw)
     if not analyses:
+        preview = (raw or "(empty response)")[:120].replace("\n", " ")
         return [
             {"id": c["id"], "playbookClause": "", "classification": "",
-             "reason": "(AI analysis failed — review manually)", "alternative": ""}
+             "reason": f"(Parse error — model returned: {preview}…)", "alternative": ""}
             for c in clauses
         ]
     return analyses
@@ -1014,7 +1096,7 @@ def export_to_excel(results, metadata, title, subtitle="", prepared_by="") -> By
 def init_state():
     defaults = {
         "llm_provider": "Anthropic Claude",
-        "llm_model": "claude-sonnet-4-6",
+        "llm_model": None,
         "results": None,
         "original_results": None,
         "metadata": None,
@@ -1034,10 +1116,9 @@ def init_state():
 def render_sidebar():
     with st.sidebar:
         st.markdown("### 📋 RFP Compliance Analyzer")
-        st.caption("v6 · Session-based")
+        st.caption("v7 · Session-based")
         st.divider()
 
-        # ── LLM Provider ──────────────────────────────────────────────────────
         st.markdown("#### 🤖 AI Provider")
         provider = st.selectbox(
             "Provider",
@@ -1077,11 +1158,10 @@ def render_sidebar():
 
         key_present = bool(_get_secret(cfg["secret_key"]))
         if key_present:
-            st.success(f"✓ {cfg['secret_key']} found · {len(models)} model(s) verified")
+            st.success(f"✓ {cfg['secret_key']} found · {len(models)} model(s) available")
         else:
-            st.error(f"✗ {cfg['secret_key']} missing — using curated default list")
+            st.error(f"✗ {cfg['secret_key']} missing — using fallback")
 
-        # ── Test API button ──────────────────────────────────────────────────
         if st.button("🧪 Test API", help="Send a tiny test request to verify the key + model work",
                      use_container_width=True):
             if not key_present:
@@ -1109,7 +1189,6 @@ def render_sidebar():
 
         st.divider()
 
-        # ── Teaching Corrections ──────────────────────────────────────────────
         corrections = st.session_state["corrections"]
         st.markdown(f"#### 🎓 Teaching Examples ({len(corrections)})")
         if corrections:
