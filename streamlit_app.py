@@ -1,8 +1,10 @@
 """
-RFP Compliance Analyzer — v5
+RFP Compliance Analyzer — v6
 ==============================
-Improvements over v4:
- (i) Explicit CSS to guarantee scrollable dropdowns regardless of list length
+Improvements over v5:
+ (i)   Curated model allowlists per provider (3-4 known-good models each)
+ (ii)  Live API verification: only show curated models the API key can access
+ (iii) "Test API" button for one-click diagnosis of billing/rate/auth errors
 
 Single-file Streamlit app. Session-based storage.
 """
@@ -59,10 +61,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Global CSS: guarantee scroll on long dropdowns ────────────────────────────
-# BaseWeb's listbox defaults already scroll, but this locks the behavior
-# explicitly across Streamlit versions and ensures long model lists never
-# overflow off-screen.
+# Global CSS: guarantee scroll on long dropdowns
 st.markdown(
     """
     <style>
@@ -85,7 +84,6 @@ BATCH_SIZE = 5
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _get_secret(key: str):
-    """Try Streamlit secrets first, then environment variables."""
     try:
         val = st.secrets.get(key)
         if val:
@@ -96,16 +94,9 @@ def _get_secret(key: str):
 
 
 def check_password() -> bool:
-    """
-    Single-password gate. Reads APP_PASSWORD from Streamlit secrets.
-    If APP_PASSWORD is not set, the gate is bypassed (dev mode).
-    Returns True if authenticated; False otherwise.
-    """
     expected = _get_secret("APP_PASSWORD")
-
     if not expected:
         return True
-
     if st.session_state.get("password_correct", False):
         return True
 
@@ -136,107 +127,102 @@ def check_password() -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DYNAMIC MODEL LISTS
+# CURATED MODEL ALLOWLISTS
 # ══════════════════════════════════════════════════════════════════════════════
+# Hand-picked, known-good models per provider. The dropdown shows the
+# intersection of (allowlist) ∩ (live API list) — so the user only ever
+# sees models that are both known-good AND verified accessible to their key.
+# If the live fetch fails, the allowlist itself is shown.
 
-DEFAULT_ANTHROPIC_MODELS = [
-    "claude-opus-4-7",
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5-20251001",
+ANTHROPIC_RECOMMENDED = [
+    "claude-haiku-4-5-20251001",   # cheapest, fastest
+    "claude-sonnet-4-6",            # balanced (default)
+    "claude-opus-4-6",              # premium
+    "claude-opus-4-7",              # latest premium
 ]
 
-DEFAULT_OPENAI_MODELS = [
-    "gpt-5.5",
-    "gpt-5.5-pro",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.4-nano",
-    "gpt-5.2",
+# All paid tier — picking only the latest stable family
+OPENAI_RECOMMENDED = [
+    "gpt-5.4-nano",   # cheapest
+    "gpt-5.4-mini",   # cheap
+    "gpt-5.4",        # balanced
+    "gpt-5.5",        # premium
 ]
 
-DEFAULT_GEMINI_MODELS = [
-    "gemini-3-flash-preview",
-    "gemini-3.1-pro-preview",
-    "gemini-3.1-flash-lite-preview",
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
+# Free-tier-friendly options first; pro is paid
+GEMINI_RECOMMENDED = [
+    "gemini-2.5-flash-lite",   # cheapest, free tier
+    "gemini-2.5-flash",         # free tier (recommended)
+    "gemini-2.5-pro",           # paid, best quality
 ]
 
-DEFAULT_GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
-    "qwen/qwen3-32b",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
+# Only known-free Groq models — preview/paid models excluded
+GROQ_RECOMMENDED = [
+    "llama-3.1-8b-instant",          # fastest, free tier
+    "llama-3.3-70b-versatile",       # balanced, free tier (recommended)
 ]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_anthropic_models(api_key: str) -> list:
     if not api_key or Anthropic is None:
-        return DEFAULT_ANTHROPIC_MODELS
+        return ANTHROPIC_RECOMMENDED
     try:
         client = Anthropic(api_key=api_key)
         page = client.models.list(limit=50)
-        ids = [m.id for m in page.data if m.id.startswith("claude")]
-        return ids or DEFAULT_ANTHROPIC_MODELS
+        live_ids = {m.id for m in page.data}
+        verified = [m for m in ANTHROPIC_RECOMMENDED if m in live_ids]
+        return verified or ANTHROPIC_RECOMMENDED
     except Exception:
-        return DEFAULT_ANTHROPIC_MODELS
+        return ANTHROPIC_RECOMMENDED
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_openai_models(api_key: str) -> list:
     if not api_key or OpenAI is None:
-        return DEFAULT_OPENAI_MODELS
+        return OPENAI_RECOMMENDED
     try:
         client = OpenAI(api_key=api_key)
         page = client.models.list()
-        ids = [m.id for m in page.data]
-        excluded = ("embed", "whisper", "tts", "dall", "instruct",
-                    "transcribe", "moderation", "babbage", "davinci",
-                    "audio", "image", "realtime")
-        ids = [i for i in ids if i.startswith("gpt-")
-               and not any(x in i.lower() for x in excluded)]
-        return sorted(set(ids), reverse=True) or DEFAULT_OPENAI_MODELS
+        live_ids = {m.id for m in page.data}
+        verified = [m for m in OPENAI_RECOMMENDED if m in live_ids]
+        return verified or OPENAI_RECOMMENDED
     except Exception:
-        return DEFAULT_OPENAI_MODELS
+        return OPENAI_RECOMMENDED
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_gemini_models(api_key: str) -> list:
     if not api_key or genai is None:
-        return DEFAULT_GEMINI_MODELS
+        return GEMINI_RECOMMENDED
     try:
         genai.configure(api_key=api_key)
-        ids = []
+        live_ids = set()
         for m in genai.list_models():
             methods = getattr(m, "supported_generation_methods", []) or []
             if "generateContent" not in methods:
                 continue
             name = (m.name or "").replace("models/", "")
             if name:
-                ids.append(name)
-        return ids or DEFAULT_GEMINI_MODELS
+                live_ids.add(name)
+        verified = [m for m in GEMINI_RECOMMENDED if m in live_ids]
+        return verified or GEMINI_RECOMMENDED
     except Exception:
-        return DEFAULT_GEMINI_MODELS
+        return GEMINI_RECOMMENDED
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_groq_models(api_key: str) -> list:
     if not api_key or Groq is None:
-        return DEFAULT_GROQ_MODELS
+        return GROQ_RECOMMENDED
     try:
         client = Groq(api_key=api_key)
         page = client.models.list()
-        excluded = ("whisper", "tts", "embed")
-        ids = [m.id for m in page.data
-               if not any(x in m.id.lower() for x in excluded)]
-        return sorted(ids) or DEFAULT_GROQ_MODELS
+        live_ids = {m.id for m in page.data}
+        verified = [m for m in GROQ_RECOMMENDED if m in live_ids]
+        return verified or GROQ_RECOMMENDED
     except Exception:
-        return DEFAULT_GROQ_MODELS
+        return GROQ_RECOMMENDED
 
 
 def clear_model_caches():
@@ -249,31 +235,27 @@ def clear_model_caches():
 LLM_PROVIDERS = {
     "Anthropic Claude": {
         "fetch": fetch_anthropic_models,
-        "defaults": DEFAULT_ANTHROPIC_MODELS,
         "secret_key": "ANTHROPIC_API_KEY",
         "native_pdf": True,
-        "hint": "Best overall quality. Native PDF understanding.",
+        "hint": "Best overall quality. Native PDF understanding. Paid only.",
     },
     "OpenAI": {
         "fetch": fetch_openai_models,
-        "defaults": DEFAULT_OPENAI_MODELS,
         "secret_key": "OPENAI_API_KEY",
         "native_pdf": False,
-        "hint": "Strong reasoning. PDFs are text-extracted first.",
+        "hint": "Strong reasoning. Paid only. PDFs are text-extracted first.",
     },
     "Google Gemini": {
         "fetch": fetch_gemini_models,
-        "defaults": DEFAULT_GEMINI_MODELS,
         "secret_key": "GOOGLE_API_KEY",
         "native_pdf": False,
-        "hint": "Large context window. Good for very long documents.",
+        "hint": "Free tier on 2.5-flash and flash-lite. Large context window.",
     },
     "Groq (Open Source)": {
         "fetch": fetch_groq_models,
-        "defaults": DEFAULT_GROQ_MODELS,
         "secret_key": "GROQ_API_KEY",
         "native_pdf": False,
-        "hint": "Fastest inference. Free tier available. Great for demos.",
+        "hint": "Fully free tier. Fastest inference. Lower quality on legal nuance.",
     },
 }
 
@@ -356,11 +338,9 @@ def extract_xlsx_text(file_obj) -> str:
 def prepare_file(uploaded_file, provider_name: str) -> dict:
     if uploaded_file is None:
         return None
-
     name = uploaded_file.name.lower()
     provider_cfg = LLM_PROVIDERS.get(provider_name, {})
     use_native_pdf = provider_cfg.get("native_pdf", False)
-
     uploaded_file.seek(0)
 
     if name.endswith(".pdf"):
@@ -432,10 +412,7 @@ def call_llm(system: str, user_blocks, max_tokens: int = 4000) -> str:
             st.stop()
         genai.configure(api_key=key)
         text = user_blocks if isinstance(user_blocks, str) else _blocks_to_text(user_blocks)
-        m = genai.GenerativeModel(
-            model_name=model,
-            system_instruction=system,
-        )
+        m = genai.GenerativeModel(model_name=model, system_instruction=system)
         resp = m.generate_content(
             text,
             generation_config=genai.GenerationConfig(max_output_tokens=max_tokens),
@@ -475,6 +452,41 @@ def _blocks_to_text(blocks) -> str:
         else:
             parts.append(str(b))
     return "\n\n".join(parts)
+
+
+def diagnose_error(err: Exception) -> tuple:
+    """
+    Inspect an exception from call_llm and return (icon, category, hint).
+    Used by the Test API button to give actionable diagnosis.
+    """
+    msg = str(err).lower()
+    if "credit" in msg or "balance" in msg or "insufficient_quota" in msg:
+        return ("💳", "Billing",
+                "Your account has zero credits. Top up at the provider's billing page.")
+    if "rate" in msg and "limit" in msg:
+        return ("⏰", "Rate limit",
+                "Too many requests in a short window. Wait 60s and retry, or pick a smaller model.")
+    if "quota" in msg or "limit: 0" in msg:
+        return ("📊", "Quota",
+                "Your account/region has no quota allocated for this model. "
+                "Check provider console; may need billing enabled.")
+    if "401" in msg or "unauthor" in msg or "invalid" in msg and "key" in msg:
+        return ("🔑", "Auth",
+                "API key is invalid, expired, or revoked. "
+                "Generate a new key in the provider console and update Streamlit secrets.")
+    if "404" in msg or "not_found" in msg or "does not exist" in msg:
+        return ("❌", "Model not accessible",
+                "The selected model is not available to your API tier. "
+                "Try a different model from the dropdown.")
+    if "tokens" in msg and ("limit" in msg or "exceed" in msg or "exhausted" in msg):
+        return ("📊", "Token limit",
+                "Daily/monthly token cap reached. Try again tomorrow, "
+                "switch to a smaller model, or upgrade tier.")
+    if "context" in msg and ("length" in msg or "window" in msg):
+        return ("📏", "Context too long",
+                "Document is larger than this model's context window. "
+                "Try a model with bigger context (Gemini 2.5 Pro, Claude Opus).")
+    return ("✗", "Unknown error", str(err)[:300])
 
 
 def extract_json_array(text: str):
@@ -766,7 +778,6 @@ COLUMN_ORDER = ["#", "Section / Clause", "RFP Clause", "Playbook Reference",
 
 
 def _safe_str(value) -> str:
-    """Return a safe string for python-docx (which rejects None / NaN)."""
     if value is None:
         return ""
     if isinstance(value, float) and math.isnan(value):
@@ -776,7 +787,6 @@ def _safe_str(value) -> str:
 
 def export_to_word(results, metadata, title, subtitle="", prepared_by="") -> BytesIO:
     doc = DocxDocument()
-
     doc.add_heading(_safe_str(title), level=0)
     if subtitle:
         p = doc.add_paragraph(_safe_str(subtitle))
@@ -1024,7 +1034,7 @@ def init_state():
 def render_sidebar():
     with st.sidebar:
         st.markdown("### 📋 RFP Compliance Analyzer")
-        st.caption("v5 · Session-based")
+        st.caption("v6 · Session-based")
         st.divider()
 
         # ── LLM Provider ──────────────────────────────────────────────────────
@@ -1067,9 +1077,32 @@ def render_sidebar():
 
         key_present = bool(_get_secret(cfg["secret_key"]))
         if key_present:
-            st.success(f"✓ {cfg['secret_key']} found · {len(models)} model(s) available")
+            st.success(f"✓ {cfg['secret_key']} found · {len(models)} model(s) verified")
         else:
-            st.error(f"✗ {cfg['secret_key']} missing — using default model list")
+            st.error(f"✗ {cfg['secret_key']} missing — using curated default list")
+
+        # ── Test API button ──────────────────────────────────────────────────
+        if st.button("🧪 Test API", help="Send a tiny test request to verify the key + model work",
+                     use_container_width=True):
+            if not key_present:
+                st.error("Cannot test — API key not configured.")
+            else:
+                with st.spinner(f"Testing {model}..."):
+                    try:
+                        response = call_llm(
+                            system="Reply with only the word: ok",
+                            user_blocks="Say ok",
+                            max_tokens=10,
+                        )
+                        if response and response.strip():
+                            st.success(f"✓ Working. Got: '{response.strip()[:40]}'")
+                        else:
+                            st.warning("⚠ Empty response (model may need different params)")
+                    except Exception as e:
+                        icon, category, hint = diagnose_error(e)
+                        st.error(f"{icon} **{category}**\n\n{hint}")
+                        with st.expander("Full error"):
+                            st.code(str(e)[:1000])
 
         if not cfg["native_pdf"]:
             st.info("ℹ️ PDFs will be text-extracted (this provider does not support native PDF).")
@@ -1124,7 +1157,6 @@ def render_sidebar():
                 st.error(f"Could not load corrections: {e}")
 
         st.divider()
-
         st.markdown("#### How it works")
         st.markdown(
             "1. Upload **RFP** and **Playbook**\n"
@@ -1249,8 +1281,10 @@ def render_new_analysis():
         except Exception as e:
             bar.empty()
             status.empty()
-            st.error(f"**Analysis failed:** {e}")
-            st.exception(e)
+            icon, category, hint = diagnose_error(e)
+            st.error(f"**Analysis failed — {icon} {category}**\n\n{hint}")
+            with st.expander("Full error trace"):
+                st.exception(e)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1337,8 +1371,6 @@ def render_results():
             st.rerun()
 
     st.divider()
-
-    # ── Export (Word + Excel) ─────────────────────────────────────────────────
     st.markdown("#### Export")
     col1, col2 = st.columns(2)
     with col1:
